@@ -283,7 +283,8 @@ impl ShapedText {
                     ch,
                     info.is_word_boundary(),
                     info.is_soft_wrap_opportunity(),
-                ),
+                )
+                .with_bidi_class(info.bidi_class),
                 grapheme_start: info.is_grapheme_start(),
             });
         }

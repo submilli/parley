@@ -5,6 +5,9 @@
 
 use core::ops::Range;
 
+use icu_properties::props::BidiClass;
+
+use crate::bidi::is_removed_by_x9;
 use crate::shape::Whitespace;
 
 /// Data for a single character of the source text.
@@ -266,6 +269,10 @@ impl CharacterFlags {
     const WORD_BOUNDARY: u8 = 1 << 3;
     /// Whether there is a soft wrap opportunity before the character.
     const SOFT_WRAP_OPPORTUNITY: u8 = 1 << 4;
+    /// Whether UAX #9 rule L1 resets the character to the paragraph level at the end of a line.
+    const BIDI_LINE_END_RESET: u8 = 1 << 5;
+    /// Whether UAX #9 rule X9 removes the character, so that rule L1 ignores it.
+    const BIDI_REMOVED_BY_X9: u8 = 1 << 6;
 
     #[inline(always)]
     pub fn new(source_char: char, is_word_boundary: bool, is_soft_wrap_opportunity: bool) -> Self {
@@ -302,6 +309,52 @@ impl CharacterFlags {
         self.0 & Self::SOFT_WRAP_OPPORTUNITY != 0
     }
 
+    /// These flags with the character's role in [UAX #9 rule L1][l1], given its `bidi_class`.
+    ///
+    /// [l1]: https://www.unicode.org/reports/tr9/#L1
+    #[must_use]
+    #[inline(always)]
+    pub fn with_bidi_class(self, bidi_class: BidiClass) -> Self {
+        let resets = matches!(
+            bidi_class,
+            BidiClass::WhiteSpace
+                | BidiClass::SegmentSeparator
+                | BidiClass::ParagraphSeparator
+                | BidiClass::LeftToRightIsolate
+                | BidiClass::RightToLeftIsolate
+                | BidiClass::FirstStrongIsolate
+                | BidiClass::PopDirectionalIsolate
+        );
+        let mut flags = self.0 & !(Self::BIDI_LINE_END_RESET | Self::BIDI_REMOVED_BY_X9);
+        if resets {
+            flags |= Self::BIDI_LINE_END_RESET;
+        }
+        if is_removed_by_x9(bidi_class) {
+            flags |= Self::BIDI_REMOVED_BY_X9;
+        }
+        Self(flags)
+    }
+
+    /// Whether [UAX #9 rule L1][l1] resets this character to the paragraph level when it is in
+    /// the sequence of white space (bidi class `WS`), isolate formatting characters and
+    /// separators (`S`, `B`) ending a line. No-break spaces are common separators (`CS`), which
+    /// aren't reset.
+    ///
+    /// [l1]: https://www.unicode.org/reports/tr9/#L1
+    #[inline(always)]
+    pub fn resets_at_line_end(self) -> bool {
+        self.0 & Self::BIDI_LINE_END_RESET != 0
+    }
+
+    /// Whether [UAX #9 rule X9][x9] removes this character (e.g. a zero width space), which rule
+    /// L1 then ignores.
+    ///
+    /// [x9]: https://www.unicode.org/reports/tr9/#X9
+    #[inline(always)]
+    pub fn is_removed_by_bidi_x9(self) -> bool {
+        self.0 & Self::BIDI_REMOVED_BY_X9 != 0
+    }
+
     /// Returns if there is a word boundary before the character.
     #[inline(always)]
     pub fn is_word_boundary(self) -> bool {
@@ -326,6 +379,26 @@ impl CharacterFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bidi_line_end_roles() {
+        for (class, resets, removed) in [
+            (BidiClass::WhiteSpace, true, false),
+            (BidiClass::SegmentSeparator, true, false),
+            (BidiClass::ParagraphSeparator, true, false),
+            (BidiClass::FirstStrongIsolate, true, false),
+            (BidiClass::PopDirectionalIsolate, true, false),
+            (BidiClass::CommonSeparator, false, false),
+            (BidiClass::LeftToRight, false, false),
+            (BidiClass::BoundaryNeutral, false, true),
+        ] {
+            let flags = CharacterFlags::new('a', true, false).with_bidi_class(class);
+            assert_eq!(flags.resets_at_line_end(), resets, "{class:?}");
+            assert_eq!(flags.is_removed_by_bidi_x9(), removed, "{class:?}");
+            assert!(flags.is_word_boundary(), "{class:?}");
+            assert_eq!(flags.len_utf8(), 1, "{class:?}");
+        }
+    }
 
     #[test]
     fn character_flags() {

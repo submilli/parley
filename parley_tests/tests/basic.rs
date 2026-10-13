@@ -442,6 +442,40 @@ fn leading_whitespace() {
 }
 
 #[test]
+fn whitespace_after_an_inline_box_after_a_segment_break_is_kept() {
+    let mut env = TestEnv::new(test_name!(), None);
+
+    let inline_box = InlineBox {
+        id: 0,
+        index: 0,
+        width: 10.,
+        height: 10.,
+        baseline: None,
+        kind: InlineBoxKind::InFlow,
+    };
+
+    // CSS Text 4 § 4.3.1 removes collapsible spaces directly after a segment break (e.g. a
+    // `<br>`). An inline box between them is content, so the space after it is kept, while the
+    // space before it, directly after the break, is still removed.
+    let mut builder = env.tree_builder();
+    builder.push_style_modification_span(&[StyleProperty::WhiteSpaceCollapse(
+        WhiteSpaceCollapse::Collapse,
+    )]);
+    builder.push_text("q");
+    builder.push_style_modification_span(&[StyleProperty::WhiteSpaceCollapse(
+        WhiteSpaceCollapse::Preserve,
+    )]);
+    builder.push_text("\n");
+    builder.pop_style_span();
+    builder.push_text("  ");
+    builder.push_inline_box(inline_box);
+    builder.push_text(" zz");
+    let (layout, text) = builder.build();
+    assert_eq!(text, "q\n zz");
+    assert_eq!(layout.inline_boxes()[0].index, 2);
+}
+
+#[test]
 fn collapsible_whitespace_crosses_spans_and_inline_boxes() {
     let mut env = TestEnv::new(test_name!(), None);
 

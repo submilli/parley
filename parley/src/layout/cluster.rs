@@ -191,6 +191,9 @@ impl<'a, B: Brush> Cluster<'a, B> {
     }
 
     /// Returns `true` if this is a right-to-left cluster.
+    ///
+    /// This is the direction of its [run](Run::is_rtl): white space ending a line takes the
+    /// paragraph's direction (UAX #9 rule L1).
     pub fn is_rtl(&self) -> bool {
         self.run.is_rtl()
     }

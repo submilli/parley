@@ -7,7 +7,8 @@ use crate::{
 };
 use parley::{
     Alignment, AlignmentOptions, BaseDirection, BreakReason, InlineBox, InlineBoxKind, Layout,
-    OverflowWrap, StyleProperty, TextWrapMode, WhiteSpaceCollapse, WordBreak,
+    OverflowWrap, PositionedLayoutItem, StyleProperty, TextWrapMode, WhiteSpaceCollapse, WordBreak,
+    YieldData,
 };
 
 fn nearly_eq(actual: f32, expected: f32) {
@@ -37,6 +38,14 @@ fn advance(env: &mut TestEnv, text: &str) -> f32 {
     let mut layout: Layout<ColorBrush> = builder.build(text);
     layout.break_all_lines(None);
     layout.full_width()
+}
+
+/// The text of each of `layout`'s lines (none for a line of only inline boxes).
+fn line_texts<'a>(layout: &Layout<ColorBrush>, text: &'a str) -> Vec<&'a str> {
+    layout
+        .lines()
+        .map(|line| text.get(line.text_range()).unwrap_or_default())
+        .collect()
 }
 
 #[test]
@@ -375,5 +384,226 @@ fn break_spaces_inline_boxes_and_rtl() {
             }
             nearly_eq(layout.full_width(), layout.calculate_content_widths().min);
         }
+    }
+}
+
+#[test]
+fn whitespace_after_an_overflowing_inline_box_hangs() {
+    let mut env = TestEnv::new(test_name!(), None);
+
+    // CSS Text 4 § 4.3.2: the collapsible space after an atomic inline that overflows its line
+    // hangs at the end of that line, as after an overflowing word, so the next line starts after
+    // it. The box is the line's first content, as it didn't fit after "aa ".
+    let width = advance(&mut env, "aa ") + 1.;
+    let space = advance(&mut env, " ");
+    for (text, lines, hanging) in [
+        ("aa  bb", vec!["aa ", " ", "bb"], space),
+        ("aa bb", vec!["aa ", "", "bb"], 0.),
+    ] {
+        let mut builder = env.ranged_builder(text);
+        builder.push_inline_box(InlineBox {
+            id: 0,
+            index: 3,
+            width: 3. * width,
+            height: 10.,
+            baseline: None,
+            kind: InlineBoxKind::InFlow,
+        });
+        let mut layout = builder.build(text);
+        layout.break_all_lines(Some(width));
+        assert_eq!(line_texts(&layout, text), lines, "{text:?}");
+        let line = layout.get(1).unwrap();
+        assert_eq!(line.break_reason(), BreakReason::Regular, "{text:?}");
+        nearly_eq(line.metrics().hanging_advance, hanging);
+        nearly_eq(line.metrics().advance - hanging, 3. * width);
+    }
+}
+
+#[test]
+fn line_breaks_report_their_hanging_advance() {
+    let mut env = TestEnv::new(test_name!(), None);
+
+    // A caller placing lines (e.g. beside floats) needs to know how much of a line's advance
+    // hangs: the line fits if the rest of it does (CSS Text 4 § 4.3.2).
+    let text = "aaa bbb";
+    let space = advance(&mut env, " ");
+    let mut layout: Layout<ColorBrush> = env.ranged_builder(text).build(text);
+    let width = advance(&mut env, "aaa") + space / 2.;
+    let mut breaker = layout.break_lines();
+    breaker.state_mut().set_layout_max_advance(width);
+    breaker.state_mut().set_line_max_advance(width);
+    let mut hanging = Vec::new();
+    while let Some(yielded) = breaker.break_next() {
+        if let YieldData::LineBreak(line) = yielded {
+            hanging.push(line.hanging_advance);
+        }
+    }
+    breaker.finish();
+    assert_eq!(hanging.len(), 2);
+    nearly_eq(hanging[0], space);
+    nearly_eq(hanging[1], 0.);
+    for (line, hanging) in layout.lines().zip(hanging) {
+        nearly_eq(line.metrics().hanging_advance, hanging);
+    }
+}
+
+#[test]
+fn trailing_whitespace_takes_the_paragraph_level() {
+    let mut env = TestEnv::new(test_name!(), None);
+
+    // UAX #9 L1 resets the white space at the end of a line to the paragraph level, so in a
+    // right-to-left paragraph the space ending a wrapped left-to-right run sits at the line's
+    // (left) end edge and hangs there, and the run is flush with the start (right) edge.
+    let text = "aaa aaa";
+    let word = advance(&mut env, "aaa");
+    let space = advance(&mut env, " ");
+    let width = word + space / 2.;
+    let mut builder = env.ranged_builder(text);
+    builder.set_base_direction(BaseDirection::Rtl);
+    let mut layout: Layout<ColorBrush> = builder.build(text);
+    layout.break_all_lines(Some(width));
+    layout.align(Alignment::Start, AlignmentOptions::default());
+    assert_eq!(line_texts(&layout, text), ["aaa ", "aaa"]);
+    let line = layout.get(0).unwrap();
+    nearly_eq(line.metrics().hanging_advance, space);
+    let runs: Vec<_> = line
+        .items()
+        .filter_map(|item| match item {
+            PositionedLayoutItem::GlyphRun(run) => {
+                Some((&text[run.run().text_range()], run.offset(), run.advance()))
+            }
+            PositionedLayoutItem::InlineBox(_) => None,
+        })
+        .collect();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    // In visual order: the hanging space, then the word ending at the right edge.
+    assert_eq!(runs[0].0, " ", "{runs:?}");
+    assert_eq!(runs[1].0, "aaa", "{runs:?}");
+    nearly_eq(runs[1].1 + runs[1].2, width);
+    nearly_eq(runs[0].1 + runs[0].2, runs[1].1);
+    // In visual order, as above: the space is right-to-left like the paragraph.
+    let directions: Vec<_> = line
+        .runs()
+        .map(|run| (&text[run.text_range()], run.is_rtl()))
+        .collect();
+    assert_eq!(directions, [(" ", true), ("aaa", false)]);
+
+    // The min-content width excludes the hanging space as well.
+    nearly_eq(layout.calculate_content_widths().min, word);
+}
+
+/// The text and direction of `line`'s runs, in visual order.
+fn visual_runs<'a>(line: &parley::Line<'_, ColorBrush>, text: &'a str) -> Vec<(&'a str, bool)> {
+    line.runs()
+        .map(|run| (&text[run.text_range()], run.is_rtl()))
+        .collect()
+}
+
+#[test]
+fn trailing_whitespace_of_a_right_to_left_run_hangs_at_a_left_to_right_lines_end() {
+    let mut env = TestEnv::new(test_name!(), None);
+
+    // The space between two Hebrew words is right-to-left, but ends the line once it wraps there:
+    // UAX #9 L1 resets it to the paragraph's level, so it hangs at the line's right end, past
+    // the Hebrew word, also when the line is justified.
+    let text = "abc \u{5d0}\u{5d1}\u{5d2} \u{5d0}\u{5d1}\u{5d2}";
+    let first = advance(&mut env, "abc \u{5d0}\u{5d1}\u{5d2}");
+    let space = advance(&mut env, " ");
+    let width = first + space / 2.;
+    for alignment in [Alignment::Start, Alignment::Justify] {
+        let mut layout: Layout<ColorBrush> = env.ranged_builder(text).build(text);
+        layout.break_all_lines(Some(width));
+        layout.align(alignment, AlignmentOptions::default());
+        let line = layout.get(0).unwrap();
+        nearly_eq(line.metrics().hanging_advance, space);
+        assert_eq!(
+            visual_runs(&line, text),
+            [
+                ("abc ", false),
+                ("\u{5d0}\u{5d1}\u{5d2}", true),
+                (" ", false)
+            ],
+            "{alignment:?}"
+        );
+        let content_end = line
+            .items()
+            .filter_map(|item| match item {
+                PositionedLayoutItem::GlyphRun(run) => Some(run),
+                PositionedLayoutItem::InlineBox(_) => None,
+            })
+            .nth(1)
+            .map(|run| run.offset() + run.advance())
+            .unwrap();
+        let expected = if alignment == Alignment::Justify {
+            width
+        } else {
+            first
+        };
+        nearly_eq(content_end, expected);
+    }
+}
+
+#[test]
+fn tabs_and_the_whitespace_before_them_take_the_paragraph_level() {
+    let mut env = TestEnv::new(test_name!(), None);
+
+    // UAX #9 L1 resets a segment separator (a tab) and the white space before it to the paragraph
+    // level wherever it is, so a tab splits a left-to-right run in a right-to-left paragraph,
+    // whose parts then read from right to left. A no-break space is not white space to L1.
+    for (text, runs) in [
+        (
+            "aaa\tbbb",
+            vec![("bbb", false), ("\t", true), ("aaa", false)],
+        ),
+        (
+            "aaa  \tbbb",
+            vec![("bbb", false), ("  \t", true), ("aaa", false)],
+        ),
+        (
+            "aaa \u{a0}\tbbb",
+            vec![("bbb", false), ("\t", true), ("aaa \u{a0}", false)],
+        ),
+    ] {
+        let mut builder = env.ranged_builder(text);
+        builder.set_base_direction(BaseDirection::Rtl);
+        builder.push_default(StyleProperty::WhiteSpaceCollapse(
+            WhiteSpaceCollapse::Preserve,
+        ));
+        let mut layout: Layout<ColorBrush> = builder.build(text);
+        layout.break_all_lines(None);
+        assert_eq!(layout.len(), 1, "{text:?}");
+        assert_eq!(visual_runs(&layout.get(0).unwrap(), text), runs, "{text:?}");
+    }
+}
+
+#[test]
+fn line_end_whitespace_is_reset_by_its_bidi_class() {
+    let mut env = TestEnv::new(test_name!(), None);
+
+    // UAX #9 L1 resets white space (class `WS`) ending a line, but not a narrow no-break space
+    // (`CS`), and it ignores a zero width space (`BN`, removed by rule X9) among the white space.
+    let space = advance(&mut env, " ");
+    for (text, content, first_line, runs) in [
+        (
+            "aaa\u{202f} aaa",
+            "aaa\u{202f}",
+            "aaa\u{202f} ",
+            // The no-break space, shaped as a run of its own, stays left-to-right after "aaa".
+            vec![(" ", true), ("aaa", false), ("\u{202f}", false)],
+        ),
+        (
+            "aaa \u{200b}aaa",
+            "aaa",
+            "aaa \u{200b}",
+            vec![(" \u{200b}", true), ("aaa", false)],
+        ),
+    ] {
+        let width = advance(&mut env, content) + space / 2.;
+        let mut builder = env.ranged_builder(text);
+        builder.set_base_direction(BaseDirection::Rtl);
+        let mut layout: Layout<ColorBrush> = builder.build(text);
+        layout.break_all_lines(Some(width));
+        assert_eq!(line_texts(&layout, text)[0], first_line, "{text:?}");
+        assert_eq!(visual_runs(&layout.get(0).unwrap(), text), runs, "{text:?}");
     }
 }

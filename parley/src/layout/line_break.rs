@@ -241,6 +241,10 @@ pub struct LineBreakData {
     pub reason: BreakReason,
     /// The computed advance (width) of the line
     pub advance: f32,
+    /// The part of [`advance`](Self::advance) taken by white space hanging past the line's end
+    /// (see [`LineMetrics::hanging_advance`]). The line's content fits in the available space if
+    /// `advance - hanging_advance` does.
+    pub hanging_advance: f32,
     /// The computed height of the line
     pub line_height: f32,
     /// The position of the top of the line
@@ -543,6 +547,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
         LineBreakData {
             reason,
             advance: line.metrics.advance,
+            hanging_advance: line.metrics.hanging_advance,
             line_height: line.size(),
             line_y_start,
             line_y_end: self.state.line_y,
@@ -725,12 +730,13 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         return self.max_height_break_data(height_contribution);
                     }
 
-                    // If the box fits on the current line (or we are at the start of the current line)
-                    // then simply move on to the next item
-                    if next_x <= max_advance || self.state.line.text_wrap_mode != TextWrapMode::Wrap
+                    // If the box fits on the current line then simply move on to the next item. At the
+                    // start of the line a box that doesn't fit never will, so it's consumed and
+                    // overflows. The line doesn't end there: like after an overflowing word,
+                    // whitespace following the box hangs at the end of this line (CSS Text 4
+                    // § 4.3.2), and the line breaks at the next opportunity.
+                    if box_will_be_appended || self.state.line.text_wrap_mode != TextWrapMode::Wrap
                     {
-                        // println!("BOX FITS");
-
                         self.state.append_inline_box_to_line(
                             next_x,
                             ascent_contribution,
@@ -741,21 +747,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         // We can always line break after an inline box
                         self.state.mark_line_break_opportunity();
                     } else {
-                        // If we're at the start of the line, this box will never fit, so consume it and accept the overflow.
-                        let reason = if self.state.line.x == 0.0 {
-                            // println!("BOX EMERGENCY BREAK");
-                            self.state.append_inline_box_to_line(
-                                next_x,
-                                ascent_contribution,
-                                descent_contribution,
-                                self.layout.data.quantize,
-                            );
-                            BreakReason::Emergency
-                        } else {
-                            // println!("BOX BREAK");
-                            BreakReason::Regular
-                        };
-                        return self.start_new_line(reason, max_advance, line_indent);
+                        return self.start_new_line(BreakReason::Regular, max_advance, line_indent);
                     }
                 }
                 LayoutItemKind::TextRun => {
@@ -1365,50 +1357,20 @@ fn commit_line<B: Brush>(
                 last_item_kind = item.kind;
                 committed_text_run = true;
 
-                // Map the cluster range to the source-text range. Line boundaries are always
-                // aligned to `Atom`s, i.e., line bounds are always grapheme bounds.
-                let slice = shaped_text.run_slice(item.index as u32);
-                let item_text_range = if cluster_range.is_empty() {
-                    let char_pos = shaped_clusters[cluster_range.start as usize]
-                        .chars_range()
-                        .start;
-                    let text_pos = slice.text_byte_at(char_pos);
-                    text_pos..text_pos
-                } else {
-                    let char_range = shaped_clusters[cluster_range.start as usize]
-                        .chars_range()
-                        .start
-                        ..shaped_clusters[cluster_range.end as usize - 1]
-                            .chars_range()
-                            .end;
-                    slice.text_byte_range(char_range)
-                };
+                let line_item =
+                    text_line_item(layout, item.index, shaped_run.bidi_level, cluster_range);
 
                 // Compute the text range for the line
                 // Q: Can we not simplify this computation by assuming that items are in order?
-                text_start = text_start.min(item_text_range.start);
-                text_end = text_end.max(item_text_range.end);
+                text_start = text_start.min(line_item.text_range.start);
+                text_end = text_end.max(line_item.text_range.end);
                 needs_reorder |= shaped_run.bidi_level != BidiLevel::new(0);
 
-                // Calculate the run's advance including any word/letter spacing. This doesn't
-                // include justification, as that's applied after lines are broken.
-                let effective_spacing = EffectiveSpacing::new(
-                    layout.data.runs[item.index].spacing,
-                    Justification::NONE,
-                );
-                let advance = effective_spacing.slice_advance(slice.narrow(cluster_range.clone()));
-
-                lines.line_items.push(LineItemData {
-                    kind: LayoutItemKind::TextRun,
-                    index: item.index,
-                    bidi_level: shaped_run.bidi_level,
-                    advance,
-                    shaped_cluster_range: cluster_range,
-                    text_range: item_text_range,
-                });
+                lines.line_items.push(line_item);
             }
         }
     }
+    reset_trailing_whitespace_level(layout, &mut lines.line_items, start_item_idx);
     // let end_run_idx = lines.line_items.last().map(|item| item.index).unwrap_or(0);
     let end_item_idx = lines.line_items.len();
 
@@ -1478,6 +1440,136 @@ fn commit_line<B: Brush>(
     true
 }
 
+/// The line item for the shaped clusters `cluster_range` of text run `run_index`, at `bidi_level`.
+fn text_line_item<B: Brush>(
+    layout: &Layout<B>,
+    run_index: usize,
+    bidi_level: BidiLevel,
+    cluster_range: Range<u32>,
+) -> LineItemData {
+    let shaped_text = &layout.data.shaped_text;
+    let shaped_clusters = shaped_text.shaped_clusters();
+    // Map the cluster range to the source-text range. Line boundaries are always aligned to
+    // `Atom`s, i.e., line bounds are always grapheme bounds.
+    #[expect(clippy::cast_possible_truncation, reason = "deferred")]
+    let slice = shaped_text.run_slice(run_index as u32);
+    let text_range = if cluster_range.is_empty() {
+        let char_pos = shaped_clusters[cluster_range.start as usize]
+            .chars_range()
+            .start;
+        let text_pos = slice.text_byte_at(char_pos);
+        text_pos..text_pos
+    } else {
+        let char_range = shaped_clusters[cluster_range.start as usize]
+            .chars_range()
+            .start
+            ..shaped_clusters[cluster_range.end as usize - 1]
+                .chars_range()
+                .end;
+        slice.text_byte_range(char_range)
+    };
+
+    // Calculate the run's advance including any word/letter spacing. This doesn't include
+    // justification, as that's applied after lines are broken.
+    let effective_spacing =
+        EffectiveSpacing::new(layout.data.runs[run_index].spacing, Justification::NONE);
+    let advance = effective_spacing.slice_advance(slice.narrow(cluster_range.clone()));
+
+    LineItemData {
+        kind: LayoutItemKind::TextRun,
+        index: run_index,
+        bidi_level,
+        advance,
+        shaped_cluster_range: cluster_range,
+        text_range,
+    }
+}
+
+/// Resets the white space ending the line whose items start at `start` to the paragraph's bidi
+/// level, following UAX #9 rule L1, so that reordering places it at the line's end edge, where it
+/// can hang. (Analysis already applies the rule's line-independent part, to separators such as
+/// tabs and the white space before them.)
+///
+/// A text run item that ends in such white space after content at another level is split, the
+/// white space becoming an item of its own. `line_items` must be in logical order.
+///
+/// See <https://www.unicode.org/reports/tr9/#L1>.
+fn reset_trailing_whitespace_level<B: Brush>(
+    layout: &Layout<B>,
+    line_items: &mut Vec<LineItemData>,
+    start: usize,
+) {
+    let base_level = layout.data.base_level;
+    for index in (start..line_items.len()).rev() {
+        let item = &line_items[index];
+        if item.kind == LayoutItemKind::InlineBox {
+            // An in-flow box is content, which ends the trailing white space.
+            if is_in_flow_box(layout, item) {
+                return;
+            }
+            continue;
+        }
+        let clusters = item.shaped_cluster_range.clone();
+        if clusters.is_empty() {
+            continue;
+        }
+
+        let whitespace_start = trailing_whitespace_start(layout, item);
+        if whitespace_start == clusters.end {
+            // The item ends in content.
+            return;
+        }
+        let all_whitespace = whitespace_start == clusters.start;
+        if item.bidi_level != base_level {
+            if all_whitespace {
+                line_items[index].bidi_level = base_level;
+            } else {
+                let (run_index, level) = (item.index, item.bidi_level);
+                line_items[index] =
+                    text_line_item(layout, run_index, level, clusters.start..whitespace_start);
+                let whitespace = whitespace_start..clusters.end;
+                line_items.insert(
+                    index + 1,
+                    text_line_item(layout, run_index, base_level, whitespace),
+                );
+            }
+        }
+        if !all_whitespace {
+            return;
+        }
+    }
+}
+
+/// The first shaped cluster of the white space ending text run item `item` that UAX #9 L1 resets
+/// to the paragraph level, or the end of its clusters if it ends in content. Characters rule X9
+/// removes (e.g. zero width spaces) don't end the white space.
+fn trailing_whitespace_start<B: Brush>(layout: &Layout<B>, item: &LineItemData) -> u32 {
+    #[expect(clippy::cast_possible_truncation, reason = "deferred")]
+    let slice = layout
+        .data
+        .shaped_text
+        .run_slice(item.index as u32)
+        .narrow(item.shaped_cluster_range.clone());
+    let mut whitespace_start = item.shaped_cluster_range.end;
+    for atom in slice.atoms_end().rev() {
+        let resets = atom.characters().iter().all(|character| {
+            character.flags.resets_at_line_end() || character.flags.is_removed_by_bidi_x9()
+        });
+        if !resets {
+            break;
+        }
+        whitespace_start = atom.shaped_clusters_range().start;
+    }
+    whitespace_start
+}
+
+/// Whether line item `item` is an in-flow inline box: content of the line, unlike out-of-flow
+/// boxes.
+fn is_in_flow_box<B: Brush>(layout: &Layout<B>, item: &LineItemData) -> bool {
+    item.kind == LayoutItemKind::InlineBox
+        && layout.data.inline_boxes[item.index].kind == InlineBoxKind::InFlow
+}
+
 /// Returns the advance of the whitespace hanging past the end of the line made up of `line_items`,
 /// the index one past its logically last shaped cluster that's eligible for justification (see
 /// [`Justification::justification_end_cluster`]), and the number of justification opportunities
@@ -1523,18 +1615,15 @@ fn hanging_whitespace<B: Brush>(
     'items: for line_item in line_items.iter().rev() {
         match line_item.kind {
             LayoutItemKind::InlineBox => {
-                let item = &layout.data.inline_boxes[line_item.index];
-
                 // Inline boxes don't hang.
-                if item.kind == InlineBoxKind::InFlow {
+                if is_in_flow_box(layout, line_item) {
                     break;
                 }
             }
             LayoutItemKind::TextRun => {
-                // Trailing whitespace can only hang if it ends up at the line's end edge after bidi
-                // reordering. We don't currently apply UAX #9 L1 (resetting trailing whitespace to
-                // paragraph level), so only logically-last items that match the paragraph level are
-                // guaranteed to be at that edge.
+                // Trailing whitespace hangs at the line's end edge, where UAX #9 L1 (see
+                // `reset_trailing_whitespace_level`) places it at the paragraph level. An item at
+                // another level ends in content.
                 if line_item.bidi_level != layout.data.base_level {
                     break;
                 }

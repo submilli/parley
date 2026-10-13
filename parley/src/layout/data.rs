@@ -310,13 +310,11 @@ impl<B: Brush> LayoutData<B> {
                     let slice = self.shaped_text.run_slice(item.index as u32);
                     let run_spacing = self.runs[item.index].spacing;
                     let spacing = EffectiveSpacing::new(run_spacing, Justification::NONE);
-                    // Trailing whitespace can only hang if it ends up at the line's end edge after
-                    // bidi reordering. We don't currently apply UAX #9 L1 (resetting trailing
-                    // whitespace to paragraph level), so only logically-last items that match the
-                    // paragraph level are guaranteed to be at that edge.
-                    let can_hang = item.bidi_level == self.base_level;
                     let is_rtl = item.bidi_level.is_rtl();
 
+                    // Whitespace hangs at a break whatever the run's bidi level, as line breaking
+                    // places it at the line's end edge (UAX #9 L1, see
+                    // `reset_trailing_whitespace_level`).
                     if run_spacing.is_zero() {
                         // Without letter/word spacing there are no per-atom gaps, so the run can be
                         // scanned one shaped cluster at a time instead of materializing atoms:
@@ -367,8 +365,7 @@ impl<B: Brush> LayoutData<B> {
                             // A cluster hangs if all of its characters hang. Its first character is
                             // checked via the cached flags so the common case never touches
                             // `characters`.
-                            let hangs = can_hang
-                                && whitespace_hangs(whitespace, style)
+                            let hangs = whitespace_hangs(whitespace, style)
                                 && (cluster.char_len() == 1
                                     || slice.characters_in(cluster.chars_range()).iter().all(
                                         |character| {
@@ -430,9 +427,7 @@ impl<B: Brush> LayoutData<B> {
                         running_min_width += advance;
                         running_max_width += advance;
 
-                        if !can_hang {
-                            running_hanging_whitespace = 0.0;
-                        } else if characters.len() == 1 {
+                        if characters.len() == 1 {
                             // Fast path for the common-case that the atom is a single character,
                             // and so a single shaped cluster.
                             if whitespace_hangs(whitespace, style) {

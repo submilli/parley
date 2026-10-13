@@ -170,10 +170,14 @@ impl<B: Brush> TreeStyleBuilder<B> {
         };
 
         // Whitespace at the start of the inline formatting context is removed, as is whitespace
-        // immediately following a preserved segment break. Whitespace following a preserved space
-        // or tab is retained, as only collapsible whitespace collapses.
+        // immediately following a preserved segment break (CSS Text 4 § 4.3.1). An inline box
+        // adds no text but is content, so whitespace after one that follows a break is kept.
+        // Whitespace following a preserved space or tab is retained, as only collapsible
+        // whitespace collapses.
+        let follows_segment_break =
+            !self.last_item_is_inline_box && self.text.ends_with(is_segment_break);
         let is_at_start = self.text.is_empty() && !self.last_item_is_inline_box;
-        if is_at_start || self.text.ends_with(is_segment_break) {
+        if is_at_start || follows_segment_break {
             return;
         }
 
