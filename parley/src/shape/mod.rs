@@ -195,6 +195,7 @@ pub(crate) fn shape_text<'a, B: Brush>(
     for shaped_run_idx in 0..layout.data.shaped_text.runs().len() {
         let shaped_run = &layout.data.shaped_text.runs()[shaped_run_idx];
         let run_text_byte_start = shaped_run.range.byte_range.start;
+        let run_bidi_level = shaped_run.bidi_level;
         let run_style_index = char_style_indices[shaped_run.range.char_range.start];
         let run_style = &styles[usize::from(run_style_index)];
 
@@ -210,7 +211,12 @@ pub(crate) fn shape_text<'a, B: Brush>(
         };
         while let Some((box_idx, inline_box)) = inline_box_iter.peek() {
             if inline_box.index <= run_text_byte_start {
-                layout.data.push_inline_box(*box_idx, prev_bidi_level);
+                let level = if inline_box.kind == crate::InlineBoxKind::SpanStart {
+                    run_bidi_level
+                } else {
+                    prev_bidi_level
+                };
+                layout.data.push_inline_box(*box_idx, level);
                 inline_box_iter.next();
             } else {
                 break;

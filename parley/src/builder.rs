@@ -14,7 +14,6 @@ use core::ops::{Bound, Range, RangeBounds};
 use parlance::BaseDirection;
 use parley_engine::break_overrides::LineBreakOverrideFn;
 
-use crate::InlineBoxKind;
 use crate::inline_box::InlineBox;
 use crate::resolve::{ResolvedStyle, StyleRun};
 
@@ -261,7 +260,10 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
     pub fn push_inline_box(&mut self, mut inline_box: InlineBox) {
         self.lcx.tree_style_builder.commit_uncommitted_text();
 
-        if inline_box.kind == InlineBoxKind::InFlow {
+        if inline_box.kind.is_in_flow() {
+            // A decorated span edge is content, but never a text replacement character.
+            // Commit its preceding space before recording the edge's text offset, so a
+            // closing edge follows whitespace attributed to the span it closes.
             self.lcx.tree_style_builder.flush_pending_whitespace();
             self.lcx.tree_style_builder.set_last_item_is_inline_box();
         }

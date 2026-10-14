@@ -5,3 +5,5 @@ mod test_analysis;
 mod test_builders;
 mod test_layout;
 mod utils;
+
+mod test_span_edges;

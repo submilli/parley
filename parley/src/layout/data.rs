@@ -303,6 +303,10 @@ impl<B: Brush> LayoutData<B> {
         let mut hangs_conditionally = false;
 
         let mut text_wrap_mode = TextWrapMode::Wrap;
+        // An opening decoration stays with the first content following it, so a wrap
+        // opportunity at that content splits the previous segment before the edge.
+        let mut span_start: Option<(u64, f32, f32)> = None;
+        let mut atomic_boundary = false;
 
         for item in &self.items {
             match item.kind {
@@ -336,12 +340,19 @@ impl<B: Brush> LayoutData<B> {
                                 text_wrap_mode = style.text_wrap_mode;
                                 if prev_text_wrap_mode == TextWrapMode::Wrap
                                     && (is_soft_wrap_opportunity
+                                        || atomic_boundary
                                         || style.overflow_wrap == OverflowWrap::Anywhere)
                                 {
-                                    min_width = min_width
-                                        .max(running_min_width - running_hanging_whitespace);
-                                    running_min_width = 0.0;
+                                    let (_, previous_width, hanging) = span_start.unwrap_or((
+                                        0,
+                                        running_min_width,
+                                        running_hanging_whitespace,
+                                    ));
+                                    min_width = min_width.max(previous_width - hanging);
+                                    running_min_width -= previous_width;
                                 }
+                                span_start = None;
+                                atomic_boundary = false;
                                 // See the newline handling below.
                                 if whitespace == Whitespace::Newline {
                                     min_width = min_width
@@ -397,12 +408,19 @@ impl<B: Brush> LayoutData<B> {
                         text_wrap_mode = style.text_wrap_mode;
                         if prev_text_wrap_mode == TextWrapMode::Wrap
                             && (is_soft_wrap_opportunity
+                                || atomic_boundary
                                 || style.overflow_wrap == OverflowWrap::Anywhere)
                         {
-                            min_width =
-                                min_width.max(running_min_width - running_hanging_whitespace);
-                            running_min_width = 0.0;
+                            let (_, previous_width, hanging) = span_start.unwrap_or((
+                                0,
+                                running_min_width,
+                                running_hanging_whitespace,
+                            ));
+                            min_width = min_width.max(previous_width - hanging);
+                            running_min_width -= previous_width;
                         }
+                        span_start = None;
+                        atomic_boundary = false;
 
                         // `Whitespace::Newline` are forced breaks. Note newlines have no advance.
                         if whitespace == Whitespace::Newline {
@@ -452,18 +470,32 @@ impl<B: Brush> LayoutData<B> {
                 }
                 LayoutItemKind::InlineBox => {
                     let ibox = &self.inline_boxes[item.index];
-                    if ibox.kind == InlineBoxKind::InFlow {
-                        running_max_width += ibox.width;
-                        if text_wrap_mode == TextWrapMode::Wrap {
-                            min_width =
-                                min_width.max(running_min_width - running_hanging_whitespace);
-                            min_width = min_width.max(ibox.width);
-                            running_min_width = 0.0;
-                        } else {
-                            running_min_width += ibox.width;
+                    if ibox.kind.is_in_flow() {
+                        if ibox.kind == InlineBoxKind::SpanStart && span_start.is_none() {
+                            span_start =
+                                Some((ibox.id, running_min_width, running_hanging_whitespace));
                         }
-                        // Inline boxes don't hang.
-                        running_hanging_whitespace = 0.0;
+                        running_max_width += ibox.width;
+                        if text_wrap_mode == TextWrapMode::Wrap && !ibox.kind.is_span_edge() {
+                            let (_, previous_width, hanging) = span_start.take().unwrap_or((
+                                0,
+                                running_min_width,
+                                running_hanging_whitespace,
+                            ));
+                            min_width = min_width.max(previous_width - hanging);
+                            running_min_width -= previous_width;
+                            atomic_boundary = true;
+                        }
+                        running_min_width += ibox.width;
+                        if ibox.kind == InlineBoxKind::SpanEnd
+                            && span_start.is_some_and(|(id, _, _)| id == ibox.id)
+                        {
+                            span_start = None;
+                        }
+                        // Zero-width companion edges do not stop whitespace from hanging.
+                        if !ibox.kind.is_span_edge() || ibox.width != 0.0 {
+                            running_hanging_whitespace = 0.0;
+                        }
                     }
                 }
             }

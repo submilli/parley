@@ -320,6 +320,8 @@ pub struct BreakerState {
     // Saved breaker states for reverting to a previously encountered line-breaking opportunity
     /// Saved breaker state for the last non-emergency line-breaking opportunity
     prev_boundary: Option<PrevBoundaryState>,
+    // An opening edge belongs to the text following it, including when that text starts a line.
+    span_start_boundary: Option<PrevBoundaryState>,
     /// Saved breaker state for the last emergency line-breaking opportunity
     emergency_boundary: Option<PrevBoundaryState>,
 }
@@ -339,6 +341,7 @@ impl Default for BreakerState {
             line_max_height: f32::MAX,
             line: LineState::default(),
             prev_boundary: None,
+            span_start_boundary: None,
             emergency_boundary: None,
         }
     }
@@ -358,6 +361,7 @@ impl BreakerState {
         text_metrics: LineBoxMetrics,
         is_word_separator: bool,
     ) {
+        self.span_start_boundary = None;
         self.line.items.end = self.item_idx + 1;
         self.line.clusters.end = atom.shaped_clusters_range().end;
         self.cluster_idx = atom.shaped_clusters_range().end;
@@ -391,23 +395,44 @@ impl BreakerState {
     /// Store the current iteration state so that we can revert to it if we later want to take
     /// the line breaking opportunity at this point.
     fn mark_line_break_opportunity(&mut self) {
-        self.prev_boundary = Some(PrevBoundaryState {
-            item_idx: self.item_idx,
-            run_idx: self.run_idx,
-            cluster_idx: self.cluster_idx,
-            state: self.line.clone(),
-        });
+        if self
+            .span_start_boundary
+            .as_ref()
+            .is_some_and(|boundary| boundary.state.x == 0.0)
+        {
+            return;
+        }
+        self.prev_boundary = Some(
+            self.span_start_boundary
+                .clone()
+                .unwrap_or_else(|| self.boundary_state()),
+        );
     }
 
     /// Store the current iteration state so that we can revert to it if we later want to take
     /// an *emergency* line breaking opportunity at this point.
     fn mark_emergency_break_opportunity(&mut self) {
-        self.emergency_boundary = Some(PrevBoundaryState {
+        if self
+            .span_start_boundary
+            .as_ref()
+            .is_some_and(|boundary| boundary.state.x == 0.0)
+        {
+            return;
+        }
+        self.emergency_boundary = Some(
+            self.span_start_boundary
+                .clone()
+                .unwrap_or_else(|| self.boundary_state()),
+        );
+    }
+
+    fn boundary_state(&self) -> PrevBoundaryState {
+        PrevBoundaryState {
             item_idx: self.item_idx,
             run_idx: self.run_idx,
             cluster_idx: self.cluster_idx,
             state: self.line.clone(),
-        });
+        }
     }
 
     /// Revert boundary state to prev state
@@ -416,6 +441,7 @@ impl BreakerState {
         self.run_idx = prev_state.run_idx;
         self.cluster_idx = prev_state.cluster_idx;
         self.line = prev_state.state;
+        self.span_start_boundary = None;
     }
 
     #[inline(always)]
@@ -454,6 +480,7 @@ impl BreakerState {
     #[inline(always)]
     pub fn set_line_max_height(&mut self, height: f32) {
         self.line_max_height = height;
+        self.update_max_height_exceeded();
     }
 
     /// Get the x-offset of the current line
@@ -527,6 +554,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
         self.state.items = self.lines.line_items.len();
         self.state.lines = self.lines.lines.len();
         self.state.prev_boundary = None;
+        self.state.span_start_boundary = None;
         self.state.emergency_boundary = None;
 
         // `finish_line` reads the line's accumulated vertical metrics from `self.state.line`, so
@@ -558,7 +586,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
     fn max_height_break_data(&self, line_height: f32) -> Option<YieldData> {
         Some(YieldData::MaxHeightExceeded(MaxHeightBreakData {
             advance: self.state.line.x,
-            line_height,
+            line_height: line_height.max(self.state.line.box_metrics.line_height()),
         }))
     }
 
@@ -686,6 +714,61 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         ascent_contribution,
                         descent_contribution,
                     ) = match inline_box.kind {
+                        InlineBoxKind::SpanStart | InlineBoxKind::SpanEnd => {
+                            let (ascent, descent) = span_edge_extents(inline_box);
+                            let mut metrics = self.state.line.box_metrics;
+                            metrics.add(LineBoxMetrics::for_inline_box(
+                                ascent,
+                                descent,
+                                self.layout.data.quantize,
+                            ));
+                            // An opening edge can still roll back with its content. Defer its
+                            // height yield until that content fits; a closing edge must remain
+                            // with the content already accepted on this line.
+                            if inline_box.kind == InlineBoxKind::SpanEnd
+                                && metrics.line_height() > self.state.line_max_height
+                            {
+                                return self.max_height_break_data(metrics.line_height());
+                            }
+                            if inline_box.kind == InlineBoxKind::SpanStart
+                                && self.state.span_start_boundary.is_none()
+                            {
+                                self.state.span_start_boundary = Some(self.state.boundary_state());
+                            }
+                            if inline_box.kind == InlineBoxKind::SpanEnd
+                                && self
+                                    .state
+                                    .span_start_boundary
+                                    .as_ref()
+                                    .is_some_and(|boundary| {
+                                        self.layout.data.items.get(boundary.item_idx).is_some_and(
+                                            |start| {
+                                                start.kind == LayoutItemKind::InlineBox
+                                                    && self.layout.data.inline_boxes[start.index].id
+                                                        == inline_box.id
+                                            },
+                                        )
+                                    })
+                            {
+                                self.state.span_start_boundary = None;
+                            }
+                            let next_x = self.state.line.x + inline_box.width;
+                            self.state.append_inline_box_to_line(
+                                next_x,
+                                ascent,
+                                descent,
+                                self.layout.data.quantize,
+                            );
+                            // Move the atomic box's after-boundary past its enclosing end edges.
+                            if inline_box.kind == InlineBoxKind::SpanEnd
+                                && self.state.prev_boundary.as_ref().is_some_and(|boundary| {
+                                    boundary.item_idx + 1 == self.state.item_idx
+                                })
+                            {
+                                self.state.mark_line_break_opportunity();
+                            }
+                            continue;
+                        }
                         InlineBoxKind::InFlow => {
                             let baseline = inline_box.baseline.unwrap_or(inline_box.height);
                             (
@@ -725,8 +808,19 @@ impl<'a, B: Brush> BreakLines<'a, B> {
 
                     // println!("BOX next_x: {}", next_x);
 
-                    let box_will_be_appended = next_x <= max_advance || self.state.line.x == 0.0;
-                    if height_contribution > self.state.line_max_height && box_will_be_appended {
+                    let closing_advance =
+                        self.closing_span_advance(self.state.item_idx + 1).max(0.0);
+                    let before_opening = self
+                        .state
+                        .span_start_boundary
+                        .as_ref()
+                        .map_or(self.state.line.x, |boundary| boundary.state.x);
+                    let box_will_be_appended =
+                        next_x + closing_advance <= max_advance || before_opening == 0.0;
+                    if (height_contribution > self.state.line_max_height
+                        || self.state.line.max_height_exceeded)
+                        && box_will_be_appended
+                    {
                         return self.max_height_break_data(height_contribution);
                     }
 
@@ -744,9 +838,13 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                             self.layout.data.quantize,
                         );
 
+                        self.state.span_start_boundary = None;
                         // We can always line break after an inline box
                         self.state.mark_line_break_opportunity();
                     } else {
+                        if let Some(opening) = self.state.span_start_boundary.take() {
+                            self.state.reset_to(opening);
+                        }
                         return self.start_new_line(BreakReason::Regular, max_advance, line_indent);
                     }
                 }
@@ -768,6 +866,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         self.layout.data.quantize,
                     );
 
+                    let closing_span_advance = self.closing_span_advance(self.state.item_idx + 1);
                     // Iterate over the remaining atoms in the Run
                     for atom in slice.atoms_from(self.state.cluster_idx) {
                         // Retrieve metadata about the atom
@@ -832,7 +931,17 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         // If the content fits (the x position does NOT exceed max_advance)
                         //
                         // We simply append the atom to the current line
-                        if next_x <= max_advance {
+                        let closing_advance = if atom.shaped_clusters_range().end
+                            == slice.shaped_clusters_range().end
+                        {
+                            // Closing padding must fit with its content. A negative margin
+                            // affects following positions only after the text has fitted;
+                            // it does not undo overflow encountered earlier in the word.
+                            closing_span_advance.max(0.0)
+                        } else {
+                            0.0
+                        };
+                        if next_x + closing_advance <= max_advance {
                             if max_height_exceeded {
                                 return self.max_height_break_data(line_height);
                             }
@@ -859,7 +968,9 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                                 spacing,
                                 item.bidi_level.is_rtl(),
                             );
-                            if all_hang || next_x - hanging <= max_advance {
+                            if closing_advance == 0.0 && all_hang
+                                || next_x + closing_advance - hanging <= max_advance
+                            {
                                 if max_height_exceeded {
                                     return self.max_height_break_data(line_height);
                                 }
@@ -928,6 +1039,17 @@ impl<'a, B: Brush> BreakLines<'a, B> {
         self.start_new_line(BreakReason::None, max_advance, line_indent)
     }
 
+    fn closing_span_advance(&self, next_item: usize) -> f32 {
+        self.layout.data.items[next_item..]
+            .iter()
+            .take_while(|item| {
+                item.kind == LayoutItemKind::InlineBox
+                    && self.layout.data.inline_boxes[item.index].kind == InlineBoxKind::SpanEnd
+            })
+            .map(|item| self.layout.data.inline_boxes[item.index].width)
+            .sum()
+    }
+
     /// Computes the next line in the paragraph by character count.
     ///
     /// This method breaks lines based on the number of characters rather than advance width.
@@ -959,10 +1081,20 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                     let inline_box = &self.layout.data.inline_boxes[item.index];
 
                     if inline_box.kind != InlineBoxKind::InFlow {
+                        let advance = if inline_box.kind.is_span_edge() {
+                            inline_box.width
+                        } else {
+                            0.0
+                        };
+                        let (ascent, descent) = if inline_box.kind.is_span_edge() {
+                            span_edge_extents(inline_box)
+                        } else {
+                            (f32::NEG_INFINITY, f32::NEG_INFINITY)
+                        };
                         self.state.append_inline_box_to_line(
-                            self.state.line.x,
-                            f32::NEG_INFINITY,
-                            f32::NEG_INFINITY,
+                            self.state.line.x + advance,
+                            ascent,
+                            descent,
                             self.layout.data.quantize,
                         );
                         continue;
@@ -1566,8 +1698,12 @@ fn trailing_whitespace_start<B: Brush>(layout: &Layout<B>, item: &LineItemData) 
 /// Whether line item `item` is an in-flow inline box: content of the line, unlike out-of-flow
 /// boxes.
 fn is_in_flow_box<B: Brush>(layout: &Layout<B>, item: &LineItemData) -> bool {
-    item.kind == LayoutItemKind::InlineBox
-        && layout.data.inline_boxes[item.index].kind == InlineBoxKind::InFlow
+    if item.kind != LayoutItemKind::InlineBox {
+        return false;
+    }
+    let inline_box = &layout.data.inline_boxes[item.index];
+    inline_box.kind == InlineBoxKind::InFlow
+        || inline_box.kind.is_span_edge() && inline_box.width != 0.0
 }
 
 /// Returns the advance of the whitespace hanging past the end of the line made up of `line_items`,
@@ -1738,4 +1874,13 @@ fn reorder_line_items(runs: &mut [LineItemData]) {
             i += 1;
         }
     }
+}
+
+/// Font line-box extents supplied by the caller for a decorated inline span.
+fn span_edge_extents(inline_box: &crate::InlineBox) -> (f32, f32) {
+    if inline_box.height == 0.0 && inline_box.baseline.is_none() {
+        return (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    }
+    let baseline = inline_box.baseline.unwrap_or(inline_box.height);
+    (baseline, inline_box.height - baseline)
 }

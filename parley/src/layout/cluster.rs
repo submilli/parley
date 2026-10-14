@@ -114,7 +114,9 @@ impl<'a, B: Brush> Cluster<'a, B> {
                         }
                     }
                     LineItem::InlineBox(inline_box) => {
-                        offset += inline_box.width;
+                        if inline_box.kind.is_in_flow() {
+                            offset += inline_box.width;
+                        }
                     }
                 }
             }
@@ -466,7 +468,9 @@ impl<'a, B: Brush> Cluster<'a, B> {
                     }
                 }
                 LineItem::InlineBox(inline_box) => {
-                    offset += inline_box.width;
+                    if inline_box.kind.is_in_flow() {
+                        offset += inline_box.width;
+                    }
                 }
             }
         }
