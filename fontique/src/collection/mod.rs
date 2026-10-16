@@ -5,6 +5,9 @@
 
 mod query;
 
+#[cfg(test)]
+mod base_fonts_tests;
+
 pub use query::{Query, QueryFamily, QueryFont, QueryStatus};
 
 use crate::font::FontInfoOverride;
@@ -212,7 +215,22 @@ impl Collection {
         data: Blob<u8>,
         info_override: Option<FontInfoOverride<'_>>,
     ) -> Vec<(FamilyId, Vec<FontInfo>)> {
-        self.inner.register_fonts(data, info_override)
+        self.inner.register_fonts(data, info_override, false)
+    }
+
+    /// Registers fonts in a lower-priority base layer, such as fonts supplied
+    /// by a sandbox host instead of discovered through a system font backend.
+    ///
+    /// Named lookup uses an ordinary registered family in preference to the
+    /// entire base family of the same name. Base family identifiers remain
+    /// usable directly and in generic or script fallback lists. Registration
+    /// order across the two layers does not change this precedence.
+    pub fn register_base_fonts(
+        &mut self,
+        data: Blob<u8>,
+        info_override: Option<FontInfoOverride<'_>>,
+    ) -> Vec<(FamilyId, Vec<FontInfo>)> {
+        self.inner.register_fonts(data, info_override, true)
     }
 
     /// Unregisters the font with the given attributes from the given family.
@@ -229,7 +247,7 @@ impl Collection {
     }
 
     /// Clears this collection. Un-registers all fonts previously registered via
-    /// [`Self::register_fonts`], and unsets all previously-set generic families
+    /// [`Self::register_fonts`] or [`Self::register_base_fonts`], and unsets all previously-set generic families
     /// and fallbacks. This will not remove any system fonts.
     pub fn clear(&mut self) {
         self.inner.clear();
@@ -288,11 +306,17 @@ impl Inner {
     /// This includes both system and registered fonts.
     pub fn family_names(&mut self) -> impl Iterator<Item = &str> + '_ + Clone {
         self.sync_shared();
-        FamilyNames {
-            ours: self.data.family_names.iter(),
-            system: self.system.as_ref().map(|sys| sys.family_names.iter()),
-        }
-        .map(|name| name.name())
+        self.data
+            .family_names
+            .iter()
+            .chain(self.data.base_family_names.iter())
+            .chain(
+                self.system
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|sys| sys.family_names.iter()),
+            )
+            .map(|name| name.name())
     }
 
     /// Returns an iterator over all available family identifiers in the collection.
@@ -300,13 +324,17 @@ impl Inner {
     /// This includes both system and registered fonts.
     pub fn family_ids(&mut self) -> impl Iterator<Item = FamilyId> + '_ + Clone {
         self.sync_shared();
-        self.data.family_names.ids().chain(
-            self.system
-                .as_ref()
-                .map(|sys| sys.family_names.ids())
-                .into_iter()
-                .flatten(),
-        )
+        self.data
+            .family_names
+            .ids()
+            .chain(self.data.base_family_names.ids())
+            .chain(
+                self.system
+                    .as_ref()
+                    .map(|sys| sys.family_names.ids())
+                    .into_iter()
+                    .flatten(),
+            )
     }
 
     /// Returns the family identifier for the given family name.
@@ -315,6 +343,7 @@ impl Inner {
         self.data
             .family_names
             .get(name)
+            .or_else(|| self.data.base_family_names.get(name))
             .or_else(|| {
                 self.system
                     .as_ref()
@@ -329,6 +358,7 @@ impl Inner {
         self.data
             .family_names
             .get_by_id(id)
+            .or_else(|| self.data.base_family_names.get_by_id(id))
             .or_else(|| {
                 self.system
                     .as_ref()
@@ -525,6 +555,7 @@ impl Inner {
         &mut self,
         data: Blob<u8>,
         info_override: Option<FontInfoOverride<'_>>,
+        base: bool,
     ) -> Vec<(FamilyId, Vec<FontInfo>)> {
         #[cfg(feature = "std")]
         if let Some(shared) = &self.shared {
@@ -532,14 +563,14 @@ impl Inner {
                 .data
                 .lock()
                 .unwrap()
-                .register_fonts(data, info_override);
+                .register_fonts(data, info_override, base);
             shared.bump_version();
             result
         } else {
-            self.data.register_fonts(data, info_override)
+            self.data.register_fonts(data, info_override, base)
         }
         #[cfg(not(feature = "std"))]
-        self.data.register_fonts(data, info_override)
+        self.data.register_fonts(data, info_override, base)
     }
 
     /// Unregisters the font with the given attributes from the given family.
@@ -600,26 +631,6 @@ impl Inner {
                 self.fallback_cache.reset();
             }
         }
-    }
-}
-
-#[derive(Clone)]
-struct FamilyNames<I> {
-    ours: I,
-    system: Option<I>,
-}
-
-impl<'a, I> Iterator for FamilyNames<I>
-where
-    I: Iterator<Item = &'a FamilyName> + 'a,
-{
-    type Item = &'a FamilyName;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(ours) = self.ours.next() {
-            return Some(ours);
-        }
-        self.system.as_mut()?.next()
     }
 }
 
@@ -694,6 +705,7 @@ impl System {
 #[derive(Clone, Default)]
 struct CommonData {
     family_names: FamilyNameMap,
+    base_family_names: FamilyNameMap,
     families: FamilyMap,
     generic_families: GenericFamilyMap,
     fallbacks: FallbackMap,
@@ -715,6 +727,7 @@ impl CommonData {
                 font_data,
                 source,
                 None,
+                false,
                 &mut scratch_family_name,
                 &mut families,
             );
@@ -725,6 +738,7 @@ impl CommonData {
         &mut self,
         data: Blob<u8>,
         info_override: Option<FontInfoOverride<'_>>,
+        base: bool,
     ) -> Vec<(FamilyId, Vec<FontInfo>)> {
         let mut families: HashMap<FamilyId, (FamilyName, Vec<FontInfo>)> = HashMap::default();
         let mut scratch_family_name = String::default();
@@ -738,6 +752,7 @@ impl CommonData {
             data.as_ref(),
             source,
             info_override,
+            base,
             &mut scratch_family_name,
             &mut families,
         );
@@ -753,6 +768,7 @@ impl CommonData {
         font_data: &[u8],
         source: SourceInfo,
         info_override: Option<FontInfoOverride<'_>>,
+        base: bool,
         scratch_family_name: &mut String,
         families: &mut HashMap<FamilyId, (FamilyName, Vec<FontInfo>)>,
     ) {
@@ -790,7 +806,12 @@ impl CommonData {
                 font.apply_override(info_override);
             }
 
-            let name = self.family_names.get_or_insert(family_name);
+            let names = if base {
+                &mut self.base_family_names
+            } else {
+                &mut self.family_names
+            };
+            let name = names.get_or_insert(family_name);
             families
                 .entry(name.id())
                 .or_insert_with(|| (name, Vec::default()))
@@ -815,7 +836,10 @@ impl CommonData {
         style: FontStyle,
         weight: FontWeight,
     ) -> Option<()> {
-        let family_name = self.family_names.get_by_id(family)?;
+        let family_name = self
+            .family_names
+            .get_by_id(family)
+            .or_else(|| self.base_family_names.get_by_id(family))?;
         let family = self.families.get_mut(&family)?.as_mut()?;
 
         let new_fonts = family
