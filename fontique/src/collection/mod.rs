@@ -3,10 +3,14 @@
 
 //! Support for working with font collections.
 
+mod provider;
 mod query;
+pub use provider::{FontProvider, ProvidedFamily, ProvidedFont};
 
 #[cfg(test)]
 mod base_fonts_tests;
+#[cfg(test)]
+mod provider_tests;
 
 pub use query::{Query, QueryFamily, QueryFont, QueryStatus};
 
@@ -86,6 +90,12 @@ impl Collection {
             inner: Inner::new(options),
             query_state: query::QueryState::default(),
         }
+    }
+
+    /// Supply missing named families and script fallbacks through an embedder.
+    /// Returned fonts enter the base layer, below author-registered families.
+    pub fn set_font_provider(&mut self, provider: Arc<dyn FontProvider>) {
+        self.inner.provider = Some(provider::DeferredFonts::new(provider));
     }
 
     /// Converts an unshared collection into a shared collection
@@ -270,6 +280,7 @@ struct Inner {
     #[allow(unused)]
     shared_version: CounterInt,
     fallback_cache: FallbackCache,
+    provider: Option<provider::DeferredFonts>,
 }
 
 impl Inner {
@@ -283,6 +294,7 @@ impl Inner {
             shared,
             shared_version: 0,
             fallback_cache: FallbackCache::default(),
+            provider: None,
         }
     }
 
@@ -340,7 +352,8 @@ impl Inner {
     /// Returns the family identifier for the given family name.
     pub fn family_id(&mut self, name: &str) -> Option<FamilyId> {
         self.sync_shared();
-        self.data
+        let registered = self
+            .data
             .family_names
             .get(name)
             .or_else(|| self.data.base_family_names.get(name))
@@ -349,7 +362,8 @@ impl Inner {
                     .as_ref()
                     .and_then(|sys| sys.family_names.get(name))
             })
-            .map(|n| n.id())
+            .map(|name| name.id());
+        registered.or_else(|| self.load_provider_family(name))
     }
 
     /// Returns the family name for the given family identifier.
@@ -467,6 +481,7 @@ impl Inner {
         key: impl Into<FallbackKey>,
     ) -> impl Iterator<Item = FamilyId> + '_ + Clone {
         let selector = key.into();
+        self.load_provider_fallback(selector);
         let script = selector.script();
         let lang_key = selector.locale();
         if self.fallback_cache.script != Some(script) || self.fallback_cache.language != lang_key {
@@ -615,6 +630,9 @@ impl Inner {
             self.data.clear();
         }
         self.data.clear();
+        if let Some(provider) = &mut self.provider {
+            provider.reset();
+        }
     }
 
     fn sync_shared(&mut self) {
