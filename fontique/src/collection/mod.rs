@@ -481,6 +481,12 @@ impl Inner {
         key: impl Into<FallbackKey>,
     ) -> impl Iterator<Item = FamilyId> + '_ + Clone {
         let selector = key.into();
+        // An unrelated document language must not suppress a script's fallback.
+        let selector = if selector.is_tracked() {
+            selector
+        } else {
+            FallbackKey::new(selector.script(), None)
+        };
         self.load_provider_fallback(selector);
         let script = selector.script();
         let lang_key = selector.locale();

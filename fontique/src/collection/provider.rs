@@ -53,7 +53,7 @@ impl DeferredFonts {
         let bytes = family
             .fonts
             .iter()
-            .try_fold(0usize, |sum, font| sum.checked_add(font.data.len()))?;
+            .try_fold(0_usize, |sum, font| sum.checked_add(font.data.len()))?;
         let faces = family
             .fonts
             .iter()

@@ -9,7 +9,7 @@ struct Provider(AtomicUsize);
 impl FontProvider for Provider {
     fn load_font(&self, family: &str) -> Option<ProvidedFamily> {
         self.0.fetch_add(1, Ordering::Relaxed);
-        family.eq_ignore_ascii_case("Roboto").then(|| provided())
+        family.eq_ignore_ascii_case("Roboto").then(provided)
     }
     fn load_fallback(&self, _key: FallbackKey) -> Option<ProvidedFamily> {
         self.0.fetch_add(1, Ordering::Relaxed);
@@ -137,5 +137,68 @@ fn provider_alias_cannot_replace_a_supplied_default_family() {
     assert_eq!(
         collection.family(base).unwrap().fonts()[0].weight(),
         FontWeight::new(100.0)
+    );
+}
+
+#[test]
+fn unrelated_document_languages_use_the_default_script_fallback() {
+    let (mut collection, provider) = collection();
+    let script = Script::from_bytes(*b"Arab");
+    let language = Language::parse("he").unwrap();
+    let unrelated = FallbackKey::new(script, Some(&language));
+    assert!(!unrelated.is_tracked());
+    let fonts = collection.fallback_families(unrelated).collect::<Vec<_>>();
+    assert_eq!(fonts.len(), 1);
+    assert_eq!(
+        collection
+            .fallback_families(FallbackKey::new(script, None))
+            .collect::<Vec<_>>(),
+        fonts
+    );
+    assert_eq!(provider.0.load(Ordering::Relaxed), 1);
+}
+
+struct ArabicProvider;
+impl FontProvider for ArabicProvider {
+    fn load_font(&self, _: &str) -> Option<ProvidedFamily> {
+        None
+    }
+    fn load_fallback(&self, key: FallbackKey) -> Option<ProvidedFamily> {
+        (key.script() == Script::from_bytes(*b"Arab")).then(|| ProvidedFamily {
+            name: "Noto Kufi Arabic".into(),
+            fonts: alloc::vec![ProvidedFont {
+                data: Blob::new(Arc::new(
+                    include_bytes!(
+                        "../../../parley_dev/assets/fonts/noto_fonts/NotoKufiArabic-Regular.otf"
+                    )
+                    .as_slice()
+                )),
+                indices: alloc::vec![0],
+            }],
+        })
+    }
+}
+#[test]
+fn queries_find_arabic_glyphs_under_a_hebrew_document_language() {
+    let mut collection = Collection::new(CollectionOptions {
+        shared: false,
+        system_fonts: false,
+    });
+    collection.set_font_provider(Arc::new(ArabicProvider));
+    let mut sources = SourceCache::new_shared();
+    let mut query = collection.query(&mut sources);
+    let language = Language::parse("he").unwrap();
+    query.set_fallbacks(FallbackKey::new(
+        Script::from_bytes(*b"Arab"),
+        Some(&language),
+    ));
+    let mut found = false;
+    query.matches_with(|font| {
+        found |= font.charmap().is_some_and(|map| map.map('ع').is_some());
+        QueryStatus::Continue
+    });
+    assert!(
+        found,
+        "mixed-language text must reach the provided script font"
     );
 }
